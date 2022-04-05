@@ -1,0 +1,779 @@
+# DWH CI/CD pipeline
+image: registry.affinitas.de/infrastructure/ci-images/dwh:473595f8
+
+variables:
+  TERRAFORM_PLAN: plan.tfplan
+  ECR_PLAN: ecr.tfplan
+  ROLE_ARN_ss_staging: arn:aws:iam::823530921032:role/terraform
+  ROLE_ARN_ss_production: arn:aws:iam::236932618899:role/terraform
+  ROLE_ARN_affinitas_staging: arn:aws:iam::576281407901:role/terraform-stage
+  ROLE_ARN_affinitas_production: arn:aws:iam::576281407901:role/terraform-prod
+  ROLE_ARN_staging: arn:aws:iam::297313101086:role/terraform-stage
+  ROLE_ARN_production: arn:aws:iam::156783281073:role/terraform-prod
+  DATASYNC_AGENT_NAME: datasync_agent
+  TASK_NAME: airflow_s3_efs_datasync
+  REGION: eu-west-1
+
+# Export the External ID's to be used to assume cross account IAM role
+before_script:
+  - ENV_VAR_SUFFIX=(_${CI_ENVIRONMENT_NAME}); for envr in "${ENV_VAR_SUFFIX[@]}"; do for var in $(printenv | cut -d '=' -f 1 | grep ${envr}); do key=`echo $var | awk -F"_${CI_ENVIRONMENT_NAME}" '{print $1}'`; value="${!var}"; export TF_VAR_${key}=${value}; done done
+
+stages:
+  - validate
+  - plan ECR
+  - provision ECR
+  - push to EFS
+  - build images
+  - push images
+  - build source code
+  - plan infra
+  - deploy infra
+  - test
+
+.validate_terraform: &validate
+  stage: validate
+  script:
+    - cd "terraform/${CI_ENVIRONMENT_NAME}"
+    - terraform --version
+    - export AWS_SDK_LOAD_CONFIG=1 
+    - terraform init -backend-config="role_arn=${!ROLE}" -backend-config="external_id=${EXTERNAL_ID}"
+    - terraform validate
+  except:
+    - web
+  tags:
+    - docker
+
+.validate_tf12_terraform: &validate_tf12
+  stage: validate
+  image: registry.affinitas.io/k8/ci/terraform-12
+  script:
+    - echo "${SSH_PRIVATE_KEY}" > /root/.ssh/id_rsa
+    - cd "terraform/${CI_ENVIRONMENT_NAME}-tf12"
+    - terraform --version
+    - export AWS_SDK_LOAD_CONFIG=1 
+    - terraform init -backend-config="role_arn=${!ROLE}" -backend-config="external_id=${EXTERNAL_ID}"
+    - terraform validate
+  except:
+    - web
+  tags:
+    - docker
+
+.plan_ecr: &plan_ecr
+  stage: plan ECR
+  script:
+    - cd "terraform/${CI_ENVIRONMENT_NAME}"
+    - terraform --version
+    - export AWS_SDK_LOAD_CONFIG=1
+    - terraform init -backend-config="role_arn=${!ROLE}" -backend-config="external_id=${EXTERNAL_ID}"
+    - terraform plan -target=module.infra -out=$ECR_PLAN
+  artifacts:
+    name: "$CI_JOB_STAGE-$CI_COMMIT_REF_SLUG"
+    paths:
+      - "terraform/${CI_ENVIRONMENT_NAME}/${ECR_PLAN}"
+      - terraform/.terraform/archive_files/
+  tags:
+    - docker
+
+.provision_ecr: &provision_ecr
+  stage: provision ECR
+  script:
+    - cd "terraform/${CI_ENVIRONMENT_NAME}"
+    - terraform --version
+    - export AWS_SDK_LOAD_CONFIG=1
+    - terraform init -backend-config="role_arn=${!ROLE}" -backend-config="external_id=${EXTERNAL_ID}"
+    - terraform apply -target=module.infra -input=false $ECR_PLAN
+    - terraform output -json > terraform.out.json
+  artifacts:
+    name: "$CI_JOB_STAGE-$CI_COMMIT_REF_SLUG"
+    paths:
+      - terraform/${CI_ENVIRONMENT_NAME}/terraform.out.json
+  allow_failure: false
+  tags:
+    - docker
+
+.push_to_efs: &push_to_efs
+  stage: push to EFS
+  script:
+    - export BUCKET_NAME="net.spark.dwh.${TERRAFORM_ENV_NAME}.datasync.efs"
+    - aws sts assume-role --role-arn ${!ROLE} --role-session-name ${CI_ENVIRONMENT_NAME} --external-id ${EXTERNAL_ID} > sts.json
+    - export AWS_ACCESS_KEY_ID=`cat sts.json | grep AccessKeyId | awk -F"\"" '{print $4}'`
+    - export AWS_SECRET_ACCESS_KEY=`cat sts.json | grep SecretAccessKey | awk -F"\"" '{print $4}'`
+    - export AWS_SESSION_TOKEN=`cat sts.json | grep SessionToken | awk -F"\"" '{print $4}'` 
+    - aws s3 sync efs_files/airflow/ s3://${BUCKET_NAME} --delete --region ${REGION}
+    - aws lambda invoke --function-name airflow-s3-efs-sync --log-type Tail --region ${REGION} response.json
+    - cat response.json
+    - sleep 180
+    - unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+    - rm -rf sts.json
+  tags:
+    - docker
+
+.build_template: &build
+  stage: build images
+  script:
+    - sh ./scripts/manage_libraries_docker.sh
+    - echo ${CI_BUILD_TOKEN} | docker login --username gitlab-ci-token --password-stdin ${CI_REGISTRY}
+    - export IMAGE_NAME="${CI_JOB_NAME##*:}"
+    - docker pull ${CI_REGISTRY_IMAGE}/${IMAGE_NAME}:latest || true
+    - docker build --cache-from ${CI_REGISTRY_IMAGE}/${IMAGE_NAME}:latest -t ${CI_REGISTRY_IMAGE}/${IMAGE_NAME} docker/${IMAGE_NAME}
+    - docker tag ${CI_REGISTRY_IMAGE}/${IMAGE_NAME} ${CI_REGISTRY_IMAGE}/${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}
+    - docker push ${CI_REGISTRY_IMAGE}/${IMAGE_NAME}
+    - docker push ${CI_REGISTRY_IMAGE}/${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}
+  tags:
+    - docker
+
+.ecr_push_template: &push
+  stage: push images
+  script:
+    - export IMAGE_NAME="${CI_JOB_NAME##*:}"
+    - export ECR_REPO_URL=$(jq -r ".ecr_repo_${IMAGE_NAME}_url.value" terraform/${CI_ENVIRONMENT_NAME}/terraform.out.json)
+    - echo ${ECR_REPO_URL}
+    - echo ${CI_BUILD_TOKEN} | docker login --username gitlab-ci-token --password-stdin ${CI_REGISTRY}
+    - docker pull ${CI_REGISTRY_IMAGE}/${IMAGE_NAME}
+    - aws sts assume-role --role-arn ${!ROLE} --role-session-name ${CI_ENVIRONMENT_NAME} --external-id ${EXTERNAL_ID} > sts.json
+    - export AWS_ACCESS_KEY_ID=`cat sts.json | grep AccessKeyId | awk -F"\"" '{print $4}'`
+    - export AWS_SECRET_ACCESS_KEY=`cat sts.json | grep SecretAccessKey | awk -F"\"" '{print $4}'`
+    - export AWS_SESSION_TOKEN=`cat sts.json | grep SessionToken | awk -F"\"" '{print $4}'`
+    - $(aws ecr get-login --no-include-email --region eu-west-1)
+    - docker tag ${CI_REGISTRY_IMAGE}/${IMAGE_NAME} ${ECR_REPO_URL}
+    - docker push ${ECR_REPO_URL}
+    - docker tag ${CI_REGISTRY_IMAGE}/${IMAGE_NAME} ${ECR_REPO_URL}:${CI_COMMIT_SHORT_SHA}
+    - docker push ${ECR_REPO_URL}:${CI_COMMIT_SHORT_SHA}
+    - unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+    - rm -rf sts.json
+  tags:
+    - docker
+
+.build_source_code: &build_source_code
+  stage: build source code
+  script:
+    - if [[ -z "${BUCKET_SUFFIX}" ]]; then export BUCKET_NAME="net.spark.dwh.${TERRAFORM_ENV_NAME}.code.${FUNCTION_NAME}"; else export BUCKET_NAME="net.spark.dwh.${TERRAFORM_ENV_NAME}.code.${BUCKET_SUFFIX}.${FUNCTION_NAME}"; fi
+    - sh ./scripts/manage_libraries_lambda.sh ${FUNCTION_NAME} ${TERRAFORM_ENV_NAME}
+    - aws sts assume-role --role-arn ${!ROLE} --role-session-name ${CI_ENVIRONMENT_NAME} --external-id ${EXTERNAL_ID} > sts.json
+    - export AWS_ACCESS_KEY_ID=`cat sts.json | grep AccessKeyId | awk -F"\"" '{print $4}'`
+    - export AWS_SECRET_ACCESS_KEY=`cat sts.json | grep SecretAccessKey | awk -F"\"" '{print $4}'`
+    - export AWS_SESSION_TOKEN=`cat sts.json | grep SessionToken | awk -F"\"" '{print $4}'`
+    - aws s3 cp ./lambda-functions/${TERRAFORM_ENV_NAME}/${FUNCTION_NAME}.zip s3://${BUCKET_NAME}/${FUNCTION_NAME}.zip --region ${REGION}
+    - aws s3 cp ./lambda-functions/${TERRAFORM_ENV_NAME}/${FUNCTION_NAME}.zip.base64sha256 s3://${BUCKET_NAME}/${FUNCTION_NAME}.zip.base64sha256 --region ${REGION} --content-type text/plain --metadata-directive REPLACE --acl private
+    - unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+    - rm -rf sts.json
+  tags:
+    - docker
+
+.plan_infra: &plan_infra
+  stage: plan infra
+  script:
+    - . ./scripts/fetch_latest_docker_commit_tag.sh airflow
+    - cd "terraform/${CI_ENVIRONMENT_NAME}"
+    - terraform --version
+    - export AWS_SDK_LOAD_CONFIG=1
+    - terraform init -backend-config="role_arn=${!ROLE}" -backend-config="external_id=${EXTERNAL_ID}"
+    - terraform plan -out=$TERRAFORM_PLAN
+  artifacts:
+    name: "$CI_JOB_STAGE-$CI_COMMIT_REF_SLUG"
+    paths:
+      - "terraform/${CI_ENVIRONMENT_NAME}/${TERRAFORM_PLAN}"
+      - terraform/.terraform/archive_files/
+  tags:
+    - docker
+
+.plan_tf12_infra: &plan_tf12_infra
+  stage: plan infra
+  image: registry.affinitas.io/k8/ci/terraform-12
+  script:
+    - echo "${SSH_PRIVATE_KEY}" > /root/.ssh/id_rsa
+    - cd "terraform/${CI_ENVIRONMENT_NAME}-tf12"
+    - terraform --version
+    - export AWS_SDK_LOAD_CONFIG=1
+    - terraform init -backend-config="role_arn=${!ROLE}" -backend-config="external_id=${EXTERNAL_ID}"
+    - terraform plan -out=$TERRAFORM_PLAN
+  artifacts:
+    name: "$CI_JOB_STAGE-$CI_COMMIT_REF_SLUG"
+    paths:
+      - "terraform/${CI_ENVIRONMENT_NAME}-tf12/${TERRAFORM_PLAN}"
+  tags:
+    - docker
+
+.apply_infra: &apply_infra
+  stage: deploy infra
+  script:
+    - . ./scripts/fetch_latest_docker_commit_tag.sh airflow
+    - cd terraform/${CI_ENVIRONMENT_NAME}
+    - terraform --version
+    - export AWS_SDK_LOAD_CONFIG=1
+    - terraform init -backend-config="role_arn=${!ROLE}" -backend-config="external_id=${EXTERNAL_ID}"
+    - terraform apply -input=false $TERRAFORM_PLAN
+    - terraform output -json > terraform.out.json
+    - cd -
+    - . ./scripts/handle_ecs_tasks.sh airflow-ecs-cluster
+  artifacts:
+    name: "$CI_JOB_STAGE-$CI_COMMIT_REF_SLUG"
+    paths:
+      - terraform/${CI_ENVIRONMENT_NAME}/terraform.out.json
+  allow_failure: false
+  when: manual
+  tags:
+    - docker
+
+.apply_tf12_infra: &apply_tf12_infra
+  stage: deploy infra
+  image: registry.affinitas.io/k8/ci/terraform-12
+  script:
+    - echo "${SSH_PRIVATE_KEY}" > /root/.ssh/id_rsa
+    - cd terraform/${CI_ENVIRONMENT_NAME}-tf12
+    - terraform --version
+    - export AWS_SDK_LOAD_CONFIG=1
+    - terraform init -backend-config="role_arn=${!ROLE}" -backend-config="external_id=${EXTERNAL_ID}"
+    - terraform apply -input=false $TERRAFORM_PLAN
+    - terraform output -json > terraform.out.json
+  artifacts:
+    name: "$CI_JOB_STAGE-$CI_COMMIT_REF_SLUG"
+    paths:
+      - terraform/${CI_ENVIRONMENT_NAME}-tf12/terraform.out.json
+  allow_failure: false
+  when: manual
+  tags:
+    - docker
+
+.test: &test
+  stage: test
+  script:
+    - aws sts assume-role --role-arn ${!ROLE} --role-session-name ${CI_ENVIRONMENT_NAME} --external-id ${EXTERNAL_ID} > sts.json
+    - export AWS_ACCESS_KEY_ID=`cat sts.json | grep AccessKeyId | awk -F"\"" '{print $4}'`
+    - export AWS_SECRET_ACCESS_KEY=`cat sts.json | grep SecretAccessKey | awk -F"\"" '{print $4}'`
+    - export AWS_SESSION_TOKEN=`cat sts.json | grep SessionToken | awk -F"\"" '{print $4}'`
+    - python3 scripts/e2e_raw_events_pipeline.py --timeout-seconds 60
+    - unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+    - rm -rf sts.json
+  artifacts:
+    name: "$CI_JOB_STAGE-$CI_COMMIT_REF_SLUG"
+  tags:
+    - docker
+
+validate:staging:
+  environment: staging
+  variables:
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  <<: *validate
+  only:
+    refs:
+      - merge_requests
+
+validate-tf12:staging:
+  environment: staging
+  variables:
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  <<: *validate_tf12
+  only:
+    refs:
+      - merge_requests
+  
+validate:prod:
+  environment: production
+  variables:
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  <<: *validate
+
+validate-tf12:prod:
+  environment: production
+  variables:
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  <<: *validate_tf12
+
+plan_ecr:staging:
+  environment: staging
+  variables:
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  <<: *plan_ecr
+  only:
+    refs:
+      - merge_requests
+
+plan_ecr:production:
+  environment: production
+  variables:
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  <<: *plan_ecr
+  only:
+    - master
+
+provision_ecr:staging:
+  environment: staging
+  variables:
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  <<: *provision_ecr
+  only:
+    refs:
+      - merge_requests
+  dependencies:
+    - plan_ecr:staging
+
+provision_ecr:production:
+  environment: production
+  variables:
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  <<: *provision_ecr
+  only:
+    - master
+  dependencies:
+    - plan_ecr:production
+
+push_to_efs:staging:
+  environment: staging
+  variables:
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  <<: *push_to_efs
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - efs_files/**/*
+
+push_to_efs:production:
+  environment: production
+  variables:
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  <<: *push_to_efs
+  only:
+    refs:
+      - master
+    changes:
+      - efs_files/**/*
+
+build:airflow_s3_efs_sync:
+  before_script:
+    - echo "Skipping global before_script"
+  <<: *build
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - docker/airflow_s3_efs_sync/**/*
+
+build:airflow:
+  before_script:
+    - echo "Skipping global before_script"
+  <<: *build
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - docker/airflow/**/*
+
+build:airflow_eks:
+  before_script:
+    - echo "Skipping global before_script"
+  <<: *build
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - docker/airflow_eks/**/*
+
+push:staging:airflow:
+  <<: *push
+  environment: staging
+  variables:
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  dependencies:
+    - provision_ecr:staging
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - docker/airflow/**/*
+  when: on_success
+
+push:staging:airflow_eks:
+  <<: *push
+  environment: staging
+  variables:
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  dependencies:
+    - provision_ecr:staging
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - docker/airflow_eks/**/*
+  when: on_success
+
+push:staging:airflow_s3_efs_sync:
+  <<: *push
+  environment: staging
+  variables:
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  dependencies:
+    - provision_ecr:staging
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - docker/airflow_s3_efs_sync/**/*
+  when: on_success
+  
+push:production:airflow:
+  <<: *push
+  environment: production
+  variables:
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  dependencies:
+    - provision_ecr:production
+  only:
+    refs:
+      - master
+    changes:
+      - docker/airflow/**/*
+  when: on_success
+
+push:production:airflow_eks:
+  <<: *push
+  environment: production
+  variables:
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  dependencies:
+    - provision_ecr:production
+  only:
+    refs:
+      - master
+    changes:
+      - docker/airflow_eks/**/*
+  when: on_success
+
+push:production:airflow_s3_efs_sync:
+  <<: *push
+  environment: production
+  variables:
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  dependencies:
+    - provision_ecr:production
+  only:
+    refs:
+      - master
+    changes:
+      - docker/airflow_s3_efs_sync/**/*
+  when: on_success
+
+build_package:staging:trk-events-validator:
+  <<: *build_source_code
+  environment: staging
+  variables:
+    FUNCTION_NAME: trk-events-validator
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - lambda-functions/trk-events-validator/**/*
+
+build_package:staging:trk-events-loader:
+  <<: *build_source_code
+  environment: staging
+  variables:
+    FUNCTION_NAME: trk-events-loader
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - lambda-functions/trk-events-loader/**/*
+
+build_package:staging:trk-pipeline-proxy:
+  <<: *build_source_code
+  environment: staging
+  variables:
+    FUNCTION_NAME: trk-pipeline-proxy
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - lambda-functions/trk-pipeline-proxy/**/*
+
+build_package:staging:airflow-s3-efs-sync:
+  <<: *build_source_code
+  environment: staging
+  variables:
+    FUNCTION_NAME: airflow-s3-efs-sync
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - lambda-functions/airflow-s3-efs-sync/**/*
+
+build_package:staging:db-proxy:
+  <<: *build_source_code
+  environment: affinitas_staging
+  variables:
+    BUCKET_SUFFIX: affinitas
+    FUNCTION_NAME: db-proxy
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_AFFINITAS_staging}
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - lambda-functions/db-proxy/**/*
+
+build_package:staging:ss-db-proxy:
+  <<: *build_source_code
+  environment: ss_staging
+  variables:
+    BUCKET_SUFFIX: sharedservices
+    FUNCTION_NAME: db-proxy
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_LOVEOS_staging}
+    REGION: us-west-2
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - lambda-functions/db-proxy/**/*
+
+build_package:production:trk-events-validator:
+  <<: *build_source_code
+  environment: production
+  variables:
+    FUNCTION_NAME: trk-events-validator
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  only:
+    refs:
+      - master
+    changes:
+      - lambda-functions/trk-events-validator/**/*
+
+build_package:production:trk-events-loader:
+  <<: *build_source_code
+  environment: production
+  variables:
+    FUNCTION_NAME: trk-events-loader
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  only:
+    refs:
+      - master
+    changes:
+      - lambda-functions/trk-events-loader/**/*
+
+build_package:production:trk-pipeline-proxy:
+  <<: *build_source_code
+  environment: production
+  variables:
+    FUNCTION_NAME: trk-pipeline-proxy
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+  only:
+    refs:
+      - master
+    changes:
+      - lambda-functions/trk-pipeline-proxy/**/*
+
+build_package:production:airflow-s3-efs-sync:
+  <<: *build_source_code
+  environment: production
+  variables:
+    FUNCTION_NAME: airflow-s3-efs-sync
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  only:
+    refs:
+      - master
+    changes:
+      - lambda-functions/airflow-s3-efs-sync/**/*
+
+build_package:production:db-proxy:
+  <<: *build_source_code
+  environment: affinitas_production
+  variables:
+    BUCKET_SUFFIX: affinitas
+    FUNCTION_NAME: db-proxy
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_AFFINITAS_production}
+  only:
+    refs:
+      - master
+    changes:
+      - lambda-functions/db-proxy/**/*
+
+build_package:production:ss-db-proxy:
+  <<: *build_source_code
+  environment: ss_production
+  variables:
+    BUCKET_SUFFIX: sharedservices
+    FUNCTION_NAME: db-proxy
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_LOVEOS_production}
+    REGION: us-west-2
+  only:
+    refs:
+      - master
+    changes:
+      - lambda-functions/db-proxy/**/*
+
+plan_infra:staging:
+  environment: staging
+  variables:
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  <<: *plan_infra
+  only:
+    refs:
+      - merge_requests
+
+plan_tf12_infra:staging:
+  environment: staging
+  variables:
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  <<: *plan_tf12_infra
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - terraform/staging-tf12/**/*
+      - terraform/modules/eks/**/*
+
+plan_infra:production:
+  environment: production
+  variables:
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  <<: *plan_infra
+  only:
+    - master
+
+plan_tf12_infra:production:
+  environment: production
+  variables:
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  <<: *plan_tf12_infra
+  only:
+    refs:
+      - master
+    changes:
+      - terraform/production-tf12/**/*
+      - terraform/modules/eks/**/*
+
+apply_infra:staging:
+  environment: staging
+  variables:
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  <<: *apply_infra
+  only:
+    refs:
+      - merge_requests
+  dependencies:
+    - plan_infra:staging
+
+apply_tf12_infra:staging:
+  environment: staging
+  variables:
+    TERRAFORM_ENV_NAME: stage
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  <<: *apply_tf12_infra
+  only:
+    refs:
+      - merge_requests
+    changes:
+      - terraform/staging-tf12/**/*
+      - terraform/modules/eks/**/*
+  dependencies:
+    - plan_tf12_infra:staging
+
+apply_infra:production:
+  environment: production
+  variables:
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  <<: *apply_infra
+  only:
+    - master
+  dependencies:
+    - plan_infra:production
+
+apply_tf12_infra:production:
+  environment: production
+  variables:
+    TERRAFORM_ENV_NAME: prod
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  <<: *apply_tf12_infra
+  only:
+    refs:
+      - master
+    changes:
+      - terraform/production-tf12/**/*
+      - terraform/modules/eks/**/*
+  dependencies:
+    - plan_tf12_infra:production
+
+test:staging:
+  environment: staging
+  variables:
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_staging}
+  <<: *test
+  only:
+    refs:
+      - merge_requests
+
+test:production:
+  environment: production
+  variables:
+    ROLE: ROLE_ARN_${CI_ENVIRONMENT_NAME}
+    EXTERNAL_ID: ${EXTERNAL_ID_DWH_production}
+  <<: *test
+  only:
+    - master
